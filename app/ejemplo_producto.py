@@ -8,9 +8,7 @@ Este ejemplo hace un "alerta de heladas" muy simple para las próximas 24 horas:
   2. Lo pasa por `predecir()`, que devuelve mapas de 3 km (70x35) de RH, T, U, V.
   3. Marca las zonas donde la temperatura baja de 0 °C y guarda un mapa en salidas/.
 
-IMPORTANTE: `predecir()` trae un MODELO DE RELLENO (interpolación + corrección por
-altura), solo para que el ejemplo corra. NO es un modelo válido para la hackathon.
-Reemplázalo por TU modelo de Kaggle, con los mismos pesos de tu submission final.
+`predecir()` usa la CNN de app/modelo.py con los pesos de models/modelo.pt.
 
 Uso:
     pip install -r requirements.txt
@@ -27,7 +25,8 @@ from datetime import datetime, timedelta
 
 import numpy as np
 
-from gfs_forecast import LATS as GFS_LATS, LONS as GFS_LONS, get_gfs_forecast, make_windows
+import modelo
+from gfs_forecast import get_gfs_forecast, make_windows
 
 VARS = ["RH", "T", "U", "V"]
 APP = Path(__file__).resolve().parent          # carpeta app/
@@ -35,29 +34,26 @@ RAIZ = APP.parent                                # raíz del repositorio
 
 
 # ---------------------------------------------------------------------------
-# 1. TU MODELO VA AQUÍ
+# 1. EL MODELO
 # ---------------------------------------------------------------------------
-def predecir(Xw, static):
+def predecir(Xw, static, times=None):
     """
     Entrada:
       Xw     : (N, 3, 17, 13, 4) ventanas [t-2, t-1, t] del GFS, en unidades físicas
                (RH %, T K, U m/s, V m/s). Fila 0 = norte.
       static : contenido de static.npz (dem, wrf_lats, wrf_lons, ...)
+      times  : (N,) 'YYYYMMDDHH' en UTC, la hora t de cada ventana (obligatorio).
     Salida:
       Y      : (N, 70, 35, 4) mapas a 3 km, mismas unidades. FILA 0 = SUR (como en Kaggle).
 
-    Reemplaza este cuerpo por tu modelo. Ejemplo con PyTorch:
-        modelo = MiRed(); modelo.load_state_dict(torch.load("models/mi_modelo.pt"))
-        Xn = normalizar(Xw)            # igual que en tu entrenamiento
-        Y = desnormalizar(modelo(Xn))  # (N, 70, 35, 4)
+    Usa la CNN de app/modelo.py con los pesos de models/modelo.pt.
     """
-    # --- MODELO DE RELLENO (no usar en la entrega) ---
-    Xt = Xw[:, -1]                                        # solo la hora t
-    Y = _interpolar_a_wrf(Xt, static["wrf_lats"], static["wrf_lons"])
-    dem = static["dem"].astype(np.float32)
-    dem_suave = _suavizar(dem, k=9)                       # relieve "visto" a baja resolución
-    Y[..., 1] -= 0.0065 * (dem - dem_suave)               # T baja ~6.5 °C por km extra de altura
-    return Y
+    if times is None:
+        raise ValueError("predecir() necesita times (UTC): el modelo depende de la hora del día.")
+    if len(times) != len(Xw):
+        raise ValueError(f"times ({len(times)}) y Xw ({len(Xw)}) deben tener el mismo largo.")
+    red = modelo.cargar(static)
+    return modelo.predict(red, Xw, np.asarray(times).astype(str))
 
 
 # ---------------------------------------------------------------------------
@@ -98,32 +94,6 @@ def guardar_mapa(tmin, helada, static, titulo, ruta):
     plt.close(fig)
 
 
-# ---------------------------------------------------------------------------
-# Utilidades
-# ---------------------------------------------------------------------------
-def _interpolar_a_wrf(Xt, wrf_lats, wrf_lons):
-    """Bilineal por coordenadas: (N, 17, 13, 4) GFS -> (N, 70, 35, 4) WRF (fila 0 = sur)."""
-    lat_g = GFS_LATS[::-1]                     # pasar a sur -> norte (creciente)
-    Xs = Xt[:, ::-1]
-    fi = np.interp(wrf_lats, lat_g, np.arange(len(lat_g)))
-    fj = np.interp(wrf_lons, GFS_LONS, np.arange(len(GFS_LONS)))
-    i0 = np.clip(np.floor(fi).astype(int), 0, len(lat_g) - 2); di = (fi - i0)[None, :, None, None]
-    j0 = np.clip(np.floor(fj).astype(int), 0, len(GFS_LONS) - 2); dj = (fj - j0)[None, None, :, None]
-    A = Xs[:, i0][:, :, j0]; B = Xs[:, i0][:, :, j0 + 1]
-    C = Xs[:, i0 + 1][:, :, j0]; D = Xs[:, i0 + 1][:, :, j0 + 1]
-    return ((A * (1 - dj) + B * dj) * (1 - di) + (C * (1 - dj) + D * dj) * di).astype(np.float32)
-
-
-def _suavizar(a, k=9):
-    p = k // 2
-    ap = np.pad(a, p, mode="edge")
-    out = np.zeros_like(a, dtype=np.float32)
-    for di in range(k):
-        for dj in range(k):
-            out += ap[di:di + a.shape[0], dj:dj + a.shape[1]]
-    return out / (k * k)
-
-
 def main():
     ap = argparse.ArgumentParser(description="Ejemplo de producto: alerta de heladas")
     ap.add_argument("--static", default=str(RAIZ / "data" / "static.npz"), help="ruta a static.npz (de Kaggle)")
@@ -140,7 +110,7 @@ def main():
     else:
         X, times = get_gfs_forecast(forecast_hours=a.horas, cache_path=str(APP / "gfs_cache.npz"))
     Xw, times = make_windows(X, times)
-    Y = predecir(Xw, static)
+    Y = predecir(Xw, static, times)
     assert Y.shape[1:] == (70, 35, 4), f"predecir() debe devolver (N, 70, 35, 4), devolvió {Y.shape}"
 
     tmin, hora_min, helada = alerta_heladas(Y, times)
